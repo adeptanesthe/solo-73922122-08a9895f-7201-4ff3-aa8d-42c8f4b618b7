@@ -12,11 +12,13 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .audition import split_audition
 from .calibration import calibrate
 from .wavutil import gain_limited_samples, validate_pair, write_pcm16_wav
 
@@ -97,6 +99,93 @@ def load_workspace_audio(wid: str):
     a, b = validate_pair(raw_a, raw_b)
     meta = _read_json(wdir / "meta.json")
     return meta, raw_a, raw_b, a, b
+
+
+# ---------------------------------------------------------------------------
+# B−A audition splits (one current result per workspace; older tokens die)
+# ---------------------------------------------------------------------------
+
+
+def audition_root(wid: str) -> Path:
+    return workspace_dir(wid) / "audition"
+
+
+def create_audition(
+    wid: str,
+    reference_segments: List[Dict[str, Any]],
+    monitor_segment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fit the FIR and freeze the two audition tracks for one selection.
+
+    Each call replaces the workspace's previous audition result, so audio
+    URLs from an earlier selection stop working — only the tracks of the
+    current selection are playable.
+    """
+    _meta, _raw_a, _raw_b, a, b = load_workspace_audio(wid)
+    report = split_audition(a, b, reference_segments, monitor_segment)
+    fixed_i16, residual_i16 = report.pop("_tracks")
+
+    token = "aud_" + secrets.token_hex(8)
+    root = audition_root(wid)
+    with _LOCK:
+        # Atomically retire every previous split for this workspace.
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        adir = root / token
+        adir.mkdir(parents=True, exist_ok=False)
+        try:
+            (adir / "fixed.wav").write_bytes(write_pcm16_wav(fixed_i16, 16000))
+            (adir / "residual.wav").write_bytes(write_pcm16_wav(residual_i16, 16000))
+            record = {
+                "token": token,
+                "workspace_id": wid,
+                "created_at": time.time(),
+                "reference_segments": reference_segments,
+                "monitor_segment": monitor_segment,
+                **{k: v for k, v in report.items()},
+            }
+            _atomic_write_json(adir / "record.json", record)
+        except Exception:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+
+    out = dict(report)
+    out["token"] = token
+    out["audio_urls"] = {
+        "fixed": f"/workspaces/{wid}/audition/{token}/fixed",
+        "residual": f"/workspaces/{wid}/audition/{token}/residual",
+    }
+    return out
+
+
+def audition_audio_path(wid: str, token: str, kind: str) -> Path:
+    """Resolve a current audition audio file, or raise KeyError if stale."""
+    if not token.replace("_", "").isalnum() or ".." in token:
+        raise KeyError(token)
+    if kind not in ("fixed", "residual"):
+        raise KeyError(kind)
+    adir = audition_root(wid) / token
+    # Only the single current split directory exists; an older token has
+    # been removed and therefore resolves to nothing.
+    if not adir.is_dir():
+        raise KeyError(token)
+    fpath = adir / f"{kind}.wav"
+    if not fpath.is_file():
+        raise KeyError(kind)
+    return fpath
+
+
+def invalidate_workspace_audition(wid: str) -> None:
+    """Retire the current audition split so its audio URLs stop working.
+
+    Called whenever the segment selection changes, before a new split is
+    computed: only the tracks of the most recent valid selection are
+    playable, and changing the selection stops the old tracks immediately.
+    """
+    root = audition_root(wid)
+    with _LOCK:
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

@@ -9,12 +9,13 @@
 
   var state = {
     info: null,
-    segments: [], // {start_sample, end_sample}
+    segments: [], // {start_sample, end_sample, role: 'none'|'reference'|'monitor'}
     calibration: null,
     fresh: false,
     feasible: false,
     draft: null, // {start_sample, end_sample} while dragging
-    dragging: false
+    dragging: false,
+    audition: null // last successful split for the *current* selection
   };
 
   var els = {
@@ -30,7 +31,11 @@
     calibBtn: document.getElementById("calibrate-btn"),
     openBtn: document.getElementById("open-question-btn"),
     alert: document.getElementById("calib-alert"),
-    report: document.getElementById("calib-report")
+    report: document.getElementById("calib-report"),
+    auditionBtn: document.getElementById("audition-btn"),
+    auditionHint: document.getElementById("audition-role-hint"),
+    auditionAlert: document.getElementById("audition-alert"),
+    auditionReport: document.getElementById("audition-report")
   };
 
   var COLORS = {
@@ -40,11 +45,17 @@
     bFill: "rgba(245,158,11,.30)",
     segFill: "rgba(129,140,248,.22)",
     segBorder: "#818cf8",
+    refFill: "rgba(16,185,129,.28)",
+    refBorder: "#34d399",
+    monFill: "rgba(244,113,113,.30)",
+    monBorder: "#f87171",
     draftFill: "rgba(16,185,129,.18)",
     draftBorder: "#34d399",
     grid: "rgba(148,163,184,.16)",
     text: "#93a4c3"
   };
+
+  var MAX_REFERENCE = 3;
 
   // ------------------------------------------------------------------ utils
   function fmtSec(s) { return (Math.round(s * 1000) / 1000).toFixed(2) + "s"; }
@@ -66,6 +77,95 @@
     state.fresh = false;
     state.feasible = false;
     updateOpenState();
+  }
+
+  // ----------------------------------------------------------- B−A audition
+  // Any change to the selection invalidates the split: stop playback at once
+  // and make sure only the freshly computed two tracks can ever be played.
+  var invalidateTimer = null;
+
+  function serverInvalidate() {
+    // Fire-and-forget: retire the server-side token so stale audio URLs
+    // return 404. Debounced so rapid edits send a single request.
+    clearTimeout(invalidateTimer);
+    invalidateTimer = setTimeout(function () {
+      fetch("/api/workspaces/" + WID + "/audition/invalidate", {
+        method: "POST",
+        headers: { "Accept": "application/json" }
+      }).catch(function () { /* offline edits still invalidate locally */ });
+    }, 120);
+  }
+
+  function invalidateAudition(reason) {
+    var hadResult = !!state.audition ||
+      !els.auditionReport.hidden || !els.auditionAlert.hidden;
+    bumpAuditionSeq(); // any in-flight split response is now stale
+    stopAuditionPlayers();
+    state.audition = null;
+    els.auditionReport.hidden = true;
+    els.auditionReport.innerHTML = "";
+    if (reason) showAuditionAlert("info", reason);
+    else els.auditionAlert.hidden = true;
+    updateAuditionButton();
+    // Always retire the server-side split on an actual selection change,
+    // even if no split had been rendered locally.
+    if (hadResult || reason) serverInvalidate();
+  }
+
+  function stopAuditionPlayers() {
+    Array.prototype.forEach.call(
+      els.auditionReport.querySelectorAll("audio"),
+      function (audio) {
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      }
+    );
+  }
+
+  function showAuditionAlert(kind, msg) {
+    els.auditionAlert.className = "alert " + kind;
+    els.auditionAlert.textContent = msg;
+    els.auditionAlert.hidden = false;
+  }
+
+  function hideAuditionAlert() { els.auditionAlert.hidden = true; }
+
+  function roleCounts() {
+    var ref = 0, mon = 0;
+    state.segments.forEach(function (g) {
+      if (g.role === "reference") ref += 1;
+      else if (g.role === "monitor") mon += 1;
+    });
+    return { reference: ref, monitor: mon };
+  }
+
+  function setRole(index, role) {
+    var seg = state.segments[index];
+    if (!seg) return;
+    if (role === "reference" && seg.role !== "reference" &&
+        roleCounts().reference >= MAX_REFERENCE) {
+      showAuditionAlert("warn", "最多只能标记 " + MAX_REFERENCE + " 段参考区，可先取消一段。");
+      return;
+    }
+    if (role === "monitor" && seg.role !== "monitor" &&
+        roleCounts().monitor >= 1) {
+      showAuditionAlert("warn", "诊听区只能有 1 段，可先取消现有诊听段。");
+      return;
+    }
+    seg.role = role;
+    renderList();
+    drawAll();
+    invalidateAudition("圈选角色已变更：此前拆分的两轨已停用，请重新拆分后再试听。");
+  }
+
+  function updateAuditionButton() {
+    var c = roleCounts();
+    var ready = c.reference >= 1 && c.reference <= MAX_REFERENCE && c.monitor === 1;
+    els.auditionBtn.disabled = !ready;
+    els.auditionHint.textContent =
+      "参考 " + c.reference + " / " + MAX_REFERENCE + " 段 · 诊听 " +
+      c.monitor + " / 1 段" + (ready ? " · 可以拆分" : " · 请先标记 1～3 段参考与 1 段诊听");
   }
 
   // The button stays clickable as long as >=1 segment exists; the click
@@ -101,11 +201,13 @@
       pre.forEach(function (s) {
         state.segments.push({
           start_sample: s.start_sample,
-          end_sample: s.end_sample
+          end_sample: s.end_sample,
+          role: "none"
         });
       });
       renderList();
       drawAll();
+      updateAuditionButton();
       scheduleCalibrate(350);
     })
     .catch(function (err) {
@@ -152,11 +254,16 @@
           return;
         }
         if (isDuplicate(s.start_sample, s.end_sample)) return;
-        state.segments.push({ start_sample: s.start_sample, end_sample: s.end_sample });
+        state.segments.push({
+          start_sample: s.start_sample,
+          end_sample: s.end_sample,
+          role: "none"
+        });
         hideAlert();
         renderList();
         drawAll();
         markStale();
+        invalidateAudition("圈选已变更：此前拆分的两轨已停用，请重新拆分。");
         scheduleCalibrate(150);
       });
     });
@@ -222,13 +329,19 @@
     var mid = H / 2, amp = H / 2 - 8;
     var nSamples = state.info.samples;
 
-    // segment overlays (sample -> pixel)
+    // segment overlays (sample -> pixel), colored by audition role
     state.segments.forEach(function (seg, i) {
       var x0 = (seg.start_sample / nSamples) * W;
       var x1 = (seg.end_sample / nSamples) * W;
-      ctx.fillStyle = COLORS.segFill;
+      var fill = COLORS.segFill, border = COLORS.segBorder, badge = "rgba(67,56,202,.92)";
+      if (seg.role === "reference") {
+        fill = COLORS.refFill; border = COLORS.refBorder; badge = "rgba(4,120,87,.92)";
+      } else if (seg.role === "monitor") {
+        fill = COLORS.monFill; border = COLORS.monBorder; badge = "rgba(185,28,28,.92)";
+      }
+      ctx.fillStyle = fill;
       ctx.fillRect(x0, 0, Math.max(1, x1 - x0), H);
-      ctx.strokeStyle = COLORS.segBorder;
+      ctx.strokeStyle = border;
       ctx.lineWidth = 1.5;
       ctx.strokeRect(x0 + 0.5, 0.5, Math.max(1, x1 - x0) - 1, H - 1);
 
@@ -238,7 +351,7 @@
       ctx.font = "700 11px ui-monospace, SFMono-Regular, Menlo, monospace";
       var tw = ctx.measureText(label).width;
       var pw = tw + 9, ph = 15, px = x0 + 4, py = H - ph - 5;
-      ctx.fillStyle = "rgba(67,56,202,.92)";
+      ctx.fillStyle = badge;
       roundedRect(ctx, px, py, pw, ph, 4);
       ctx.fill();
       ctx.fillStyle = "#ffffff";
@@ -326,9 +439,10 @@
         var pxWidth = ((e - s) / state.info.samples) * rect.width;
         if (e > s && pxWidth >= 8) {
           if (state.segments.length < MAX_SEGMENTS) {
-            state.segments.push({ start_sample: s, end_sample: e });
+            state.segments.push({ start_sample: s, end_sample: e, role: "none" });
             renderList();
             markStale();
+            invalidateAudition("圈选已变更：此前拆分的两轨已停用，请重新拆分。");
             scheduleCalibrate(250);
           }
         }
@@ -351,7 +465,8 @@
       row.className = "seg-row";
       var dur = sampleToSec(seg.end_sample - seg.start_sample);
       row.innerHTML =
-        '<span class="seg-index">' + (i + 1) + "</span>" +
+        '<span class="seg-index' + (seg.role === "reference" ? " ref" :
+          seg.role === "monitor" ? " mon" : "") + '">' + (i + 1) + "</span>" +
         '<div class="seg-times">' +
           '<input type="number" step="0.01" min="0" aria-label="第' + (i + 1) + '段起点（秒）" data-field="start" value="' + sampleToSec(seg.start_sample).toFixed(3) + '">' +
           "<span>→</span>" +
@@ -360,6 +475,14 @@
             (seg.end_sample - seg.start_sample).toLocaleString() + " 采样</span>" +
         "</div>" +
         '<div class="seg-actions">' +
+          '<div class="role-toggle" role="group" aria-label="第' + (i + 1) + '段诊听角色">' +
+            '<button type="button" class="role-btn ref' + (seg.role === "reference" ? " active" : "") +
+              '" data-roleact="reference" title="标为参考区（1～3 段，用于拟合 FIR）">参考</button>' +
+            '<button type="button" class="role-btn mon' + (seg.role === "monitor" ? " active" : "") +
+              '" data-roleact="monitor" title="标为诊听区（恰好 1 段，不参与拟合）">诊听</button>' +
+            '<button type="button" class="role-btn' + (seg.role === "none" ? " active" : "") +
+              '" data-roleact="none" title="不参与 B−A 拆分">未用</button>' +
+          "</div>" +
           '<button type="button" class="btn ghost sm" data-act="play" title="在波形上高亮该段">高亮</button>' +
           '<button type="button" class="btn danger sm" data-act="del">删除</button>' +
         "</div>";
@@ -382,22 +505,33 @@
           sampleToSec(e - s).toFixed(2) + " s · " + (e - s).toLocaleString() + " 采样";
         drawAll();
         markStale();
+        invalidateAudition("圈选时间已变更：此前拆分的两轨已停用，请重新拆分。");
         scheduleCalibrate(400);
       }
       startInput.addEventListener("change", onTimeChange);
       endInput.addEventListener("change", onTimeChange);
+
+      Array.prototype.forEach.call(
+        row.querySelectorAll(".role-btn"),
+        function (btn) {
+          btn.addEventListener("click", function () {
+            setRole(i, btn.getAttribute("data-roleact"));
+          });
+        }
+      );
 
       row.querySelector('[data-act=del]').addEventListener("click", function () {
         state.segments.splice(i, 1);
         renderList();
         drawAll();
         markStale();
+        invalidateAudition("圈选已删除：此前拆分的两轨已停用，请重新拆分。");
+        updateAuditionButton();
         if (state.segments.length) scheduleCalibrate(200);
         else { els.report.hidden = true; hideAlert(); }
       });
       row.querySelector('[data-act=play]').addEventListener("click", function () {
-        // Jump to the question-opening flow is not available yet; briefly
-        // highlight the segment on the waveform instead.
+        // Brief waveform highlight (no navigation target on this page).
         flashSegment(seg);
       });
 
@@ -407,6 +541,7 @@
     els.count.textContent = "已选 " + state.segments.length + " / " + MAX_SEGMENTS + " 段";
     els.addBtn.disabled = state.segments.length >= MAX_SEGMENTS;
     updateOpenState();
+    updateAuditionButton();
   }
 
   function flashSegment(seg) {
@@ -423,10 +558,11 @@
     var center = Math.floor(dur / 2);
     var s = Math.max(0, center - Math.floor(len / 2));
     var e = Math.min(dur, s + len);
-    state.segments.push({ start_sample: s, end_sample: e });
+    state.segments.push({ start_sample: s, end_sample: e, role: "none" });
     renderList();
     drawAll();
     markStale();
+    invalidateAudition("圈选已变更：此前拆分的两轨已停用，请重新拆分。");
     scheduleCalibrate(200);
   });
 
@@ -435,6 +571,7 @@
     renderList();
     drawAll();
     markStale();
+    invalidateAudition("圈选已清空：此前拆分的两轨已停用。");
     els.report.hidden = true;
     hideAlert();
   });
@@ -613,4 +750,131 @@
         els.openBtn.textContent = old;
       });
   });
+
+  // ------------------------------------------------------------- B−A split
+  var auditionSeq = 0;
+
+  function bumpAuditionSeq() { auditionSeq += 1; }
+
+  function auditionPayload() {
+    var reference = [];
+    var monitor = null;
+    state.segments.forEach(function (g) {
+      var item = { start_sample: g.start_sample, end_sample: g.end_sample };
+      if (g.role === "reference") reference.push(item);
+      else if (g.role === "monitor") monitor = item;
+    });
+    return { reference: reference, monitor: monitor };
+  }
+
+  els.auditionBtn.addEventListener("click", function () {
+    var c = roleCounts();
+    if (c.reference < 1 || c.reference > MAX_REFERENCE || c.monitor !== 1) {
+      showAuditionAlert("warn",
+        "请先标记 1～" + MAX_REFERENCE + " 段参考区和恰好 1 段诊听区。");
+      return;
+    }
+    // A new computation supersedes everything: stop any current playback
+    // immediately and retire the previous result before the request lands.
+    stopAuditionPlayers();
+    state.audition = null;
+    els.auditionReport.hidden = true;
+    hideAuditionAlert();
+
+    var seq = ++auditionSeq;
+    var oldText = els.auditionBtn.textContent;
+    els.auditionBtn.disabled = true;
+    els.auditionBtn.innerHTML = '<span class="spinner dark"></span> 拟合 FIR / 渲染两轨…';
+
+    fetch("/api/workspaces/" + WID + "/audition", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(auditionPayload())
+    })
+      .then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, status: r.status, d: d }; });
+      })
+      .then(function (res) {
+        // A newer selection change happened while the request was in flight.
+        if (seq !== auditionSeq) return;
+        if (!res.ok) {
+          if (res.d && res.d.code === "rank_deficient") {
+            showAuditionAlert("error",
+              "拟合矩阵秩不足（秩 " + res.d.rank + " / 需要 " + res.d.taps +
+              "，有效方程 " + res.d.rows + " 组）：请更换或增加参考段，" +
+              "选择两版均有声音、频谱更丰富的区间后重试。");
+          } else {
+            showAuditionAlert("error", (res.d && res.d.error) || "拆分请求失败。");
+          }
+          els.auditionReport.hidden = true;
+          return;
+        }
+        hideAuditionAlert();
+        state.audition = res.d.audition;
+        renderAudition(state.audition);
+      })
+      .catch(function (err) {
+        if (seq !== auditionSeq) return;
+        showAuditionAlert("error", "网络错误：" + err.message);
+      })
+      .finally(function () {
+        if (seq === auditionSeq) {
+          els.auditionBtn.disabled = false;
+          els.auditionBtn.textContent = oldText;
+          updateAuditionButton();
+        }
+      });
+  });
+
+  function fmtGain(g) {
+    return Number(g).toFixed(6) + "（" +
+      (20 * Math.log10(g) >= 0 ? "+" : "") +
+      (20 * Math.log10(g)).toFixed(3) + " dB）";
+  }
+
+  function renderAudition(rep) {
+    els.auditionReport.hidden = false;
+    var html = "";
+
+    if (rep.attenuated) {
+      html += '<div class="alert warn" style="margin:6px 0 12px">' +
+        "检测到试听轨会超出 PCM16 范围，两轨已按<strong>同一增益</strong>衰减，" +
+        "当前试听增益 g = <strong>" + fmtGain(rep.gain) + "</strong>" +
+        "（固定滤波轨与剩余轨电平关系保持不变）。</div>";
+    } else {
+      html += '<div class="alert ok" style="margin:6px 0 12px">' +
+        "两轨均无需衰减：试听增益 g = <strong>" + fmtGain(rep.gain) +
+        "</strong>（1.000000 / +0.000 dB）。</div>";
+    }
+
+    var mon = rep.monitor;
+    html += '<dl class="kv">' +
+      "<dt>FIR 抽头数</dt><dd>" + rep.taps + "（用 A 当前点及前 " + (rep.taps - 1) + " 点）</dd>" +
+      "<dt>有效最小二乘方程</dt><dd>" + rep.rows.toLocaleString() + " 组（目标与 32 个输入点全部在参考区内）</dd>" +
+      "<dt>设计矩阵秩</dt><dd>" + rep.rank + " / " + rep.taps + "（满秩）</dd>" +
+      "<dt>参考区拟合 R²</dt><dd>" + fmtNum(rep.r2, 5) +
+        " · 残差 σ=" + fmtNum(rep.sigma, 2) + " LSB</dd>" +
+      "<dt>诊听区</dt><dd>" + mon.start.toFixed(3) + "–" + mon.end.toFixed(3) +
+        " s · RMS B−A=" + fmtNum(mon.rms_difference, 1) +
+        " · 固定=" + fmtNum(mon.rms_fixed, 1) +
+        " · 剩余=" + fmtNum(mon.rms_residual, 1) + " LSB（衰减后）</dd>" +
+      "</dl>";
+
+    html += '<div class="audition-tracks">' +
+      auditionTrackHtml(rep, "fixed", "固定滤波轨（FIR 可解释的 B−A）",
+        "ref") +
+      auditionTrackHtml(rep, "residual", "剩余轨（B−A 减去固定滤波）", "mon") +
+      "</div>";
+
+    html += '<p class="small muted">两轨逐点相加恒等于原始 B−A；改圈选或改角色会立即停播并使本两轨失效。</p>';
+    els.auditionReport.innerHTML = html;
+  }
+
+  function auditionTrackHtml(rep, kind, title, cls) {
+    var url = rep.audio_urls[kind] + "?t=" + encodeURIComponent(rep.token);
+    return '<div class="audition-track ' + cls + '">' +
+      '<div class="audition-track-head"><strong>' + title + "</strong></div>" +
+      '<audio controls preload="none" src="' + url + '"></audio>' +
+      "</div>";
+  }
 })();

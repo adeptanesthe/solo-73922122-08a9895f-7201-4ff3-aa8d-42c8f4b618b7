@@ -57,6 +57,31 @@
   <div id="calib-report" hidden></div>
 </div>
 
+<div class="card" id="audition-card">
+  <h2>B−A 诊听拆分（固定滤波可解释声 vs. 剩余声）</h2>
+  <p class="small muted" style="margin-top:0">
+    用原始 A、B 把诊听区的 <code>B−A</code> 拆成两条可分别播放的音轨：以参考区内
+    <strong>A 的当前点及前 31 点（共 32 点）</strong>预测 <code>B−A</code>，
+    最小二乘拟合<strong>同一组 32 抽头 FIR</strong>；滤波能解释的部分为“固定滤波轨”，
+    其余为“剩余轨”，两轨逐点相加恒等于 <code>B−A</code>。目标与全部 32 个输入点都须
+    落在参考区内，任一点进入诊听区则整组方程剔除；参考段重叠只计一次。
+  </p>
+  <p class="small muted" style="margin-top:0">
+    在下方每段行里把 <strong>1～3 段标为「参考」</strong>，再把<strong>另 1 段标为
+    「诊听」</strong>（诊听区不得与参考区重叠），然后点击拆分。任一条 PCM16 试听轨会
+    削波时，两轨会按同一增益衰减并显示该增益。改动圈选会立即停止播放，只有本次拆分
+    算出的两轨可以试听。
+  </p>
+
+  <div class="actions" style="margin-top:0">
+    <button class="btn" id="audition-btn" type="button" disabled>拆分 B−A 两轨</button>
+    <span class="muted small" id="audition-role-hint"></span>
+  </div>
+
+  <div id="audition-alert" class="alert" hidden></div>
+  <div id="audition-report" hidden></div>
+</div>
+
 <div class="actions">
   <a class="btn ghost" href="/questions">查看历史题目 →</a>
 </div>

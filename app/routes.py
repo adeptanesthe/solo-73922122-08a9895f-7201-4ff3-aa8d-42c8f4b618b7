@@ -16,6 +16,7 @@ from flask import (
 )
 
 from . import samples_dir
+from .audition import AuditionError, RankDeficientError
 from .calibration import (
     MAX_SEGMENTS,
     MIN_SEGMENTS,
@@ -26,8 +27,11 @@ from .calibration import (
 )
 from .storage import (
     InfeasibleCalibration,
+    audition_audio_path,
+    create_audition,
     create_question,
     create_workspace,
+    invalidate_workspace_audition,
     list_questions,
     load_workspace_audio,
     public_question,
@@ -300,6 +304,83 @@ def open_question(wid: str):
     if wants_json():
         return jsonify({"ok": True, "redirect": target, "question": rec}), 201
     return _redirect_see_other(target)
+
+
+# ---------------------------------------------------------------------------
+# B−A audition split (fixed-filter vs. residual)
+# ---------------------------------------------------------------------------
+
+
+def _audition_payload():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        raise AuditionError("请求体必须是包含 reference / monitor 的 JSON 对象")
+    refs = body.get("reference")
+    monitor = body.get("monitor")
+    # Convenience alias.
+    if refs is None and "reference_segments" in body:
+        refs = body["reference_segments"]
+    if monitor is None and "monitor_segment" in body:
+        monitor = body["monitor_segment"]
+    if not isinstance(refs, list) or not refs:
+        raise AuditionError("请圈选 1～3 段参考区并提交 reference 数组")
+    if not isinstance(monitor, dict):
+        raise AuditionError("请圈选恰好 1 段诊听区并提交 monitor 对象")
+    return refs, monitor
+
+
+@bp.post("/api/workspaces/<wid>/audition")
+def api_audition_split(wid: str):
+    try:
+        refs, monitor = _audition_payload()
+        report = create_audition(wid, refs, monitor)
+    except KeyError:
+        return jsonify({"ok": False, "error": "工作区不存在或已过期"}), 404
+    except (AuditionError, SegmentError) as e:
+        return jsonify({"ok": False, "error": str(e),
+                        "code": "invalid_audition"}), 400
+    except RankDeficientError as e:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "code": "rank_deficient",
+                    "error": str(e),
+                    "rank": e.rank,
+                    "rows": e.rows,
+                    "taps": e.taps,
+                }
+            ),
+            409,
+        )
+    except WavError as e:
+        return jsonify({"ok": False, "error": str(e), "code": "invalid_wav"}), 400
+    return jsonify({"ok": True, "audition": report}), 201
+
+
+@bp.get("/workspaces/<wid>/audition/<token>/<kind>")
+def audition_audio(wid: str, token: str, kind: str):
+    try:
+        fpath = audition_audio_path(wid, token, kind)
+    except KeyError:
+        abort(404)
+    data = fpath.read_bytes()
+    resp = Response(data, mimetype="audio/wav")
+    # A re-split or any selection change replaces/removes the token
+    # directory, so these URLs are not stable; keep them uncacheable.
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Length"] = str(len(data))
+    return resp
+
+
+@bp.post("/api/workspaces/<wid>/audition/invalidate")
+def api_audition_invalidate(wid: str):
+    """Retire the current split when the selection changes on the page."""
+    try:
+        invalidate_workspace_audition(wid)
+    except KeyError:
+        return jsonify({"ok": False, "error": "工作区不存在或已过期"}), 404
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
